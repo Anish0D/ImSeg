@@ -1,22 +1,19 @@
 import torch
-import torchvision
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
-from torchvision import datasets, transforms
-import torch.optim as optim
-
+import torchvision.transforms as transforms
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
 import matplotlib.pyplot as plt
 import numpy as np
-
 import os
 import random
 from PIL import Image
-from torch.utils.data import Dataset, DataLoader, ConcatDataset
-import torchvision.transforms as transforms
 
-# Device
+# -------------------- Config --------------------
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+TARGET_SIZE = [1024, 768]  # [height, width]
+MODEL_SAVE_PATH = "unet_segmentation_model.pth"
 
 # -------------------- Dataset --------------------
 class CarSegmentationDataset(Dataset):
@@ -41,8 +38,6 @@ class CarSegmentationDataset(Dataset):
         return image, mask
 
 # -------------------- Augmentations --------------------
-TARGET_SIZE = [1024, 768]  # [height, width]
-
 def augmentation_1(image, mask):
     if random.random() > 0.5:
         image = TF.hflip(image)
@@ -77,7 +72,7 @@ def no_aug(image, mask):
     mask = TF.resize(mask, TARGET_SIZE)
     return image, mask
 
-# -------------------- Path Loader --------------------
+# -------------------- Path Loading --------------------
 def load_paths(root_dir):
     img_dir = os.path.join(root_dir, 'img')
     mask_dir = os.path.join(root_dir, 'masks')
@@ -87,10 +82,7 @@ def load_paths(root_dir):
     mask_paths = [os.path.join(mask_dir, name) for name in mask_names]
     return list(zip(img_paths, mask_paths))
 
-# -------------------- Data Split --------------------
-all_pairs = all_pairs = load_paths('/Users/sangeetadegalmadikar/Desktop/SDSU_Internship/ImSeg/cars')
-
-
+all_pairs = load_paths('/Users/sangeetadegalmadikar/Desktop/SDSU_Internship/ImSeg/cars')
 random.seed(42)
 random.shuffle(all_pairs)
 
@@ -119,43 +111,156 @@ train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
 val_loader = DataLoader(validation_dataset, batch_size=2, shuffle=False)
 test_loader = DataLoader(test_dataset, batch_size=2, shuffle=False)
 
-# U-Net Model
-def doubleConv(input_channels, output_channels):
-    conv = nn.Sequential(
-        nn.Conv2d(input_channels, output_channels, kernel_size=3),
+#  U-Net Model 
+def doubleConv(in_channels, out_channels):
+    return nn.Sequential(
+        nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
         nn.ReLU(inplace=True),
-        nn.Conv2d(output_channels, output_channels, kernel_size=3),
+        nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
         nn.ReLU(inplace=True)
     )
-    return conv
 
 class Unet(nn.Module):
     def __init__(self):
         super(Unet, self).__init__()
-        self.max_pool_2x2 = nn.MaxPool2d(kernel_size=2, stride=2)
-
         self.down_conv_1 = doubleConv(1, 64)
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
         self.down_conv_2 = doubleConv(64, 128)
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
         self.down_conv_3 = doubleConv(128, 256)
-        self.down_conv_4 = doubleConv(256, 512) 
-        self.down_conv_5 = doubleConv(512, 1024)
+        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.down_conv_4 = doubleConv(256, 512)
+        self.pool4 = nn.MaxPool2d(kernel_size=2, stride=2)
 
-    def forward(self, image):
-        x1 = self.down_conv_1(image)
-        print(f"x1: {x1.shape}")
-        x2 = self.max_pool_2x2(x1)
+        self.bottleneck = doubleConv(512, 1024)
+
+        self.up_trans_1 = nn.ConvTranspose2d(1024, 512, kernel_size=2, stride=2)
+        self.up_conv_1 = doubleConv(1024, 512)
+        self.up_trans_2 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
+        self.up_conv_2 = doubleConv(512, 256)
+        self.up_trans_3 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+        self.up_conv_3 = doubleConv(256, 128)
+        self.up_trans_4 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.up_conv_4 = doubleConv(128, 64)
+
+        self.output_layer = nn.Conv2d(64, 1, kernel_size=1)
+
+    def crop_and_concat(self, enc_feat, x):
+        if enc_feat.size()[2:] != x.size()[2:]:
+            diffY = enc_feat.size()[2] - x.size()[2]
+            diffX = enc_feat.size()[3] - x.size()[3]
+            enc_feat = enc_feat[:, :, diffY//2:-diffY//2, diffX//2:-diffX//2]
+        return torch.cat([enc_feat, x], dim=1)
+
+    def forward(self, x):
+        x1 = self.down_conv_1(x)
+        x2 = self.pool1(x1)
         x3 = self.down_conv_2(x2)
-        x4 = self.max_pool_2x2(x3)
+        x4 = self.pool2(x3)
         x5 = self.down_conv_3(x4)
-        x6 = self.max_pool_2x2(x5)
+        x6 = self.pool3(x5)
         x7 = self.down_conv_4(x6)
-        x8 = self.max_pool_2x2(x7)
-        x9 = self.down_conv_5(x8)
-        print(f"x9: {x9.shape}")
-        return x9
+        x8 = self.pool4(x7)
+
+        x9 = self.bottleneck(x8)
+
+        x = self.up_trans_1(x9)
+        x = self.crop_and_concat(x7, x)
+        x = self.up_conv_1(x)
+
+        x = self.up_trans_2(x)
+        x = self.crop_and_concat(x5, x)
+        x = self.up_conv_2(x)
+
+        x = self.up_trans_3(x)
+        x = self.crop_and_concat(x3, x)
+        x = self.up_conv_3(x)
+
+        x = self.up_trans_4(x)
+        x = self.crop_and_concat(x1, x)
+        x = self.up_conv_4(x)
+
+        return self.output_layer(x)
 
 
-if __name__ == "__main__":
-    image = torch.rand(1, 1, 1024, 768).to(device)  # Updated input size
-    model = Unet().to(device)
-    print(model(image))
+def dice_score(pred, target, epsilon=1e-6):
+    pred = pred.view(-1)
+    target = target.view(-1)
+    intersection = (pred * target).sum()
+    return (2. * intersection + epsilon) / (pred.sum() + target.sum() + epsilon)
+
+def iou_score(pred, target, epsilon=1e-6):
+    pred = pred.view(-1)
+    target = target.view(-1)
+    intersection = (pred * target).sum()
+    union = pred.sum() + target.sum() - intersection
+    return (intersection + epsilon) / (union + epsilon)
+
+def visualize_prediction(image, pred_mask, true_mask):
+    image = image.squeeze().cpu().numpy()
+    pred_mask = pred_mask.squeeze().cpu().numpy()
+    true_mask = true_mask.squeeze().cpu().numpy()
+
+    fig, axs = plt.subplots(1, 3, figsize=(12, 4))
+    axs[0].imshow(image, cmap='gray')
+    axs[0].set_title('Input Image')
+    axs[1].imshow(pred_mask, cmap='gray')
+    axs[1].set_title('Predicted Mask')
+    axs[2].imshow(true_mask, cmap='gray')
+    axs[2].set_title('Ground Truth')
+
+    for ax in axs:
+        ax.axis('off')
+    plt.tight_layout()
+    plt.show()
+
+
+model = Unet().to(device)
+criterion = nn.BCEWithLogitsLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+num_epochs = 5
+
+for epoch in range(num_epochs):
+    model.train()
+    running_loss = 0.0
+    for images, masks in train_loader:
+        images, masks = images.to(device), masks.to(device)
+
+        preds = model(images)
+        loss = criterion(preds, masks)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+
+    avg_loss = running_loss / len(train_loader)
+
+    # Evaluate on validation set
+    model.eval()
+    dice_total, iou_total, count = 0.0, 0.0, 0
+    val_images, val_masks = None, None
+    with torch.no_grad():
+        for val_images, val_masks in val_loader:
+            val_images, val_masks = val_images.to(device), val_masks.to(device)
+            val_preds = model(val_images)
+            val_probs = torch.sigmoid(val_preds)
+            val_bin = (val_probs > 0.5).float()
+            for i in range(val_images.size(0)):
+                dice_total += dice_score(val_bin[i], val_masks[i])
+                iou_total += iou_score(val_bin[i], val_masks[i])
+                count += 1
+
+    avg_dice = dice_total / count
+    avg_iou = iou_total / count
+
+    print(f"Epoch {epoch+1}/{num_epochs} | Loss: {avg_loss:.4f} | Dice: {avg_dice:.4f} | IoU: {avg_iou:.4f}")
+
+    # Visualize prediction from one random validation image
+    rand_idx = random.randint(0, val_images.size(0) - 1)
+    visualize_prediction(val_images[rand_idx], val_bin[rand_idx], val_masks[rand_idx])
+
+
+# Final save
+torch.save(model.state_dict(), MODEL_SAVE_PATH)
